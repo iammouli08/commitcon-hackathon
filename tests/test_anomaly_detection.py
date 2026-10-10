@@ -2,7 +2,11 @@ import unittest
 
 import pandas as pd
 
-from anomaly_detection import classification_metrics, detect_anomalies
+from anomaly_detection import (
+    classification_metrics,
+    detect_anomalies,
+    extract_hour_of_day,
+)
 
 
 def transaction(
@@ -12,6 +16,7 @@ def transaction(
     category="Food",
     merchant="Cafe",
     review_feedback=None,
+    transaction_hour=None,
 ):
     return {
         "id": transaction_id,
@@ -21,6 +26,7 @@ def transaction(
         "merchant": merchant,
         "direction": "Debit",
         "review_feedback": review_feedback,
+        "transaction_hour": transaction_hour,
     }
 
 
@@ -34,7 +40,7 @@ class PersonalBaselineTests(unittest.TestCase):
             merchant="New Merchant",
         )
         result = detect_anomalies(pd.DataFrame([record]), 5000, 3)
-        self.assertEqual(result.iloc[0]["anomaly_score"], 20)
+        self.assertEqual(result.iloc[0]["anomaly_score"], 10)
         self.assertFalse(result.iloc[0]["is_anomaly"])
 
     def test_category_baselines_distinguish_food_from_shopping(self):
@@ -97,8 +103,8 @@ class PersonalBaselineTests(unittest.TestCase):
             transaction("spike", "2026-02-28", 100, merchant="I"),
         ]
         result = detect_anomalies(pd.DataFrame(records), 10000, 3).set_index("id")
-        self.assertEqual(result.at["spike", "anomaly_score"], 30)
-        self.assertTrue(result.at["spike", "is_anomaly"])
+        self.assertEqual(result.at["spike", "anomaly_score"], 20)
+        self.assertFalse(result.at["spike", "is_anomaly"])
 
         monday_dates = pd.date_range("2026-01-05", periods=8, freq="W-MON")
         timing_records = [
@@ -112,6 +118,75 @@ class PersonalBaselineTests(unittest.TestCase):
             pd.DataFrame(timing_records), 10000, 3
         ).set_index("id")
         self.assertEqual(timing.at["tuesday", "anomaly_score"], 10)
+
+    def test_monthly_category_spend_compares_complete_prior_months(self):
+        records = [
+            transaction(f"food-{month}", f"2026-{month:02}-15", 900)
+            for month in range(1, 4)
+        ]
+        records.extend(
+            transaction(
+                f"shopping-{month}",
+                f"2026-{month:02}-16",
+                3000,
+                category="Shopping",
+                merchant=f"Shop {month}",
+            )
+            for month in range(1, 4)
+        )
+        records.extend(
+            [
+                transaction(
+                    "food-month-spike",
+                    "2026-04-01",
+                    3000,
+                    category="Food",
+                    merchant="New Cafe",
+                ),
+                transaction(
+                    "usual-shopping",
+                    "2026-04-02",
+                    2000,
+                    category="Shopping",
+                    merchant="New Shop",
+                ),
+            ]
+        )
+        result = detect_anomalies(pd.DataFrame(records), 2500, 3).set_index("id")
+        self.assertTrue(result.at["food-month-spike", "is_anomaly"])
+        self.assertEqual(result.at["food-month-spike", "anomaly_score"], 30)
+        self.assertIn("usual monthly Food spending", result.at["food-month-spike", "reason"])
+        self.assertFalse(result.at["usual-shopping", "is_anomaly"])
+
+    def test_explicit_transaction_hour_drives_time_of_day_signal(self):
+        self.assertEqual(extract_hour_of_day("Purchase at 9:35 AM"), 9)
+        self.assertEqual(extract_hour_of_day("Transaction time: 21:45"), 21)
+        self.assertIsNone(extract_hour_of_day("No transaction time provided"))
+
+        records = [
+            transaction(
+                f"morning-{i}",
+                f"2026-01-{i + 1:02}",
+                100,
+                merchant=f"Merchant {i}",
+                transaction_hour=9,
+            )
+            for i in range(8)
+        ]
+        records.append(
+            transaction(
+                "late-night",
+                "2026-02-01",
+                1000,
+                merchant="New Merchant",
+                transaction_hour=23,
+            )
+        )
+        result = detect_anomalies(
+            pd.DataFrame(records), 10000, 3
+        ).set_index("id")
+        self.assertEqual(result.at["late-night", "anomaly_score"], 40)
+        self.assertIn("unusual time of day", result.at["late-night", "reason"])
 
     def test_review_feedback_clears_alerts_and_teaches_future_baseline(self):
         records = [

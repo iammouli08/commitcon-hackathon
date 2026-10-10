@@ -1,27 +1,48 @@
 """Explainable, per-user spending baselines and anomaly scoring."""
 
 import math
+import re
 
 import pandas as pd
 
 
 ALERT_SCORE_THRESHOLD = 30
+TRANSACTION_TIME_RE = re.compile(
+    r"\b(?:at\s+)?(?P<hour>0?[1-9]|1[0-2]|[01]?\d|2[0-3]):"
+    r"(?P<minute>[0-5]\d)\s*(?P<period>am|pm)?\b",
+    re.IGNORECASE,
+)
 REVIEW_FEEDBACK = {
     "expected": "Expected spending",
     "legitimate": "Unusual but legitimate",
     "needs_review": "Needs further review",
 }
 SIGNAL_WEIGHTS = {
-    "amount": 20,
+    "amount": 10,
     "category": 30,
     "merchant": 20,
-    "frequency": 20,
+    "frequency": 10,
     "timing": 10,
+    "monthly": 20,
 }
 
 
 def _timestamp(value):
     return pd.to_datetime(value, errors="coerce", utc=True)
+
+
+def extract_hour_of_day(text):
+    """Read an explicit transaction time from message text, never email metadata."""
+    match = TRANSACTION_TIME_RE.search(str(text))
+    if not match:
+        return None
+    hour = int(match.group("hour"))
+    period = (match.group("period") or "").lower()
+    if period:
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if period == "pm" else 0)
+    return hour
 
 
 def _category_amount_is_unusual(amount, history, multiplier):
@@ -74,6 +95,28 @@ def _timing_is_unusual(current_date, category_history):
     return weekdays.count(current_date.weekday()) / len(weekdays) <= 0.1
 
 
+def _month_number(date):
+    return date.year * 12 + date.month
+
+
+def _monthly_spend_is_unusual(
+    amount, current_date, monthly_totals, first_category_month, multiplier
+):
+    current_month = _month_number(current_date)
+    first_month = first_category_month
+    if first_month is None or current_month - first_month < 3:
+        return False
+    previous_months = [
+        monthly_totals.get(month, 0.0)
+        for month in range(first_month, current_month)
+    ]
+    if len(previous_months) < 3:
+        return False
+    median = pd.Series(previous_months, dtype="float64").median()
+    month_to_date = monthly_totals.get(current_month, 0.0) + amount
+    return month_to_date > max(median * multiplier, median + 500)
+
+
 def detect_anomalies(df, absolute_threshold, multiplier):
     """Score debits against each user's earlier, accepted spending history."""
     result = df.copy()
@@ -84,6 +127,9 @@ def detect_anomalies(df, absolute_threshold, multiplier):
 
     category_history = {}
     merchant_history = {}
+    category_monthly_totals = {}
+    category_first_month = {}
+    category_time_history = {}
     ordered = sorted(
         result.index,
         key=lambda index: (
@@ -104,6 +150,12 @@ def detect_anomalies(df, absolute_threshold, multiplier):
         category = str(row.get("category", "Other"))
         merchant = str(row.get("merchant", "Unknown merchant"))
         current_date = _timestamp(row.get("date"))
+        raw_hour = row.get("transaction_hour")
+        transaction_hour = (
+            int(raw_hour)
+            if raw_hour is not None and not pd.isna(raw_hour) and 0 <= int(raw_hour) <= 23
+            else None
+        )
         reasons = []
         score = 0
 
@@ -128,11 +180,33 @@ def detect_anomalies(df, absolute_threshold, multiplier):
             ):
                 score += SIGNAL_WEIGHTS["frequency"]
                 reasons.append(f"more frequent than your usual {category} spending")
-            if not pd.isna(current_date) and _timing_is_unusual(
+            weekday_unusual = not pd.isna(current_date) and _timing_is_unusual(
                 current_date, prior_category
-            ):
+            )
+            hour_unusual = (
+                transaction_hour is not None
+                and len(prior_hours := category_time_history.get(category, [])) >= 8
+                and sum(
+                    hour // 4 == transaction_hour // 4 for hour in prior_hours
+                )
+                / len(prior_hours)
+                <= 0.1
+            )
+            if weekday_unusual or hour_unusual:
                 score += SIGNAL_WEIGHTS["timing"]
-                reasons.append(f"unusual timing for {category} spending")
+            if weekday_unusual:
+                reasons.append(f"unusual weekday for {category} spending")
+            if hour_unusual:
+                reasons.append(f"unusual time of day for {category} spending")
+            if not pd.isna(current_date) and _monthly_spend_is_unusual(
+                amount,
+                current_date,
+                category_monthly_totals.get(category, {}),
+                category_first_month.get(category),
+                multiplier,
+            ):
+                score += SIGNAL_WEIGHTS["monthly"]
+                reasons.append(f"above your usual monthly {category} spending")
 
         is_anomaly = is_debit and score >= ALERT_SCORE_THRESHOLD
         result.at[index, "anomaly_score"] = score
@@ -147,7 +221,7 @@ def detect_anomalies(df, absolute_threshold, multiplier):
         elif is_anomaly:
             result.at[index, "review_status"] = "Needs review"
 
-        accepted_as_baseline = (
+        accepted_as_baseline = feedback != "needs_review" and (
             not is_anomaly or feedback in ("expected", "legitimate")
         )
         if is_debit and accepted_as_baseline:
@@ -157,6 +231,19 @@ def detect_anomalies(df, absolute_threshold, multiplier):
             merchant_history.setdefault(merchant, []).append(
                 (current_date, amount)
             )
+            if not pd.isna(current_date):
+                month_number = _month_number(current_date)
+                previous_first_month = category_first_month.get(category)
+                if previous_first_month is None or month_number < previous_first_month:
+                    category_first_month[category] = month_number
+                monthly_totals = category_monthly_totals.setdefault(category, {})
+                monthly_totals[month_number] = (
+                    monthly_totals.get(month_number, 0.0) + amount
+                )
+            if transaction_hour is not None:
+                category_time_history.setdefault(category, []).append(
+                    transaction_hour
+                )
 
     return result
 

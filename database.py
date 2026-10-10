@@ -153,6 +153,7 @@ def init_db():
                 subject {text_type} NOT NULL,
                 marked_normal INTEGER NOT NULL DEFAULT 0,
                 review_feedback {text_type},
+                transaction_hour INTEGER,
                 PRIMARY KEY (user_id, transaction_id)
             )
         """)
@@ -161,6 +162,10 @@ def init_db():
                 conn,
                 "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS review_feedback TEXT",
             )
+            _execute(
+                conn,
+                "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS transaction_hour INTEGER",
+            )
         else:
             transaction_columns = {
                 row["name"]
@@ -168,6 +173,8 @@ def init_db():
             }
             if "review_feedback" not in transaction_columns:
                 _execute(conn, "ALTER TABLE transactions ADD COLUMN review_feedback TEXT")
+            if "transaction_hour" not in transaction_columns:
+                _execute(conn, "ALTER TABLE transactions ADD COLUMN transaction_hour INTEGER")
         _execute(
             conn,
             """
@@ -353,8 +360,8 @@ def save_transactions(username: str, records: list[dict]):
                 """
                 INSERT INTO transactions
                     (user_id, transaction_id, transaction_date, merchant, amount,
-                     direction, category, subject)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     direction, category, subject, transaction_hour)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id, transaction_id) DO NOTHING
                 """,
                 (
@@ -366,6 +373,7 @@ def save_transactions(username: str, records: list[dict]):
                     str(record["direction"]),
                     str(record["category"]),
                     "",
+                    record.get("transaction_hour"),
                 ),
             )
 
@@ -379,7 +387,8 @@ def get_transactions(username: str) -> list[dict]:
             conn,
             """
             SELECT transaction_id AS id, transaction_date AS date, merchant, amount,
-                   direction, category, subject, marked_normal, review_feedback
+                   direction, category, subject, marked_normal, review_feedback,
+                   transaction_hour
             FROM transactions WHERE user_id = ? ORDER BY transaction_date DESC
             """,
             (user_id,),

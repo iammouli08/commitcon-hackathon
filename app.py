@@ -564,7 +564,9 @@ def parse_email(email):
     return {
         "id": txid, "date": date, "merchant": merchant or "Unknown merchant",
         "amount": amount, "direction": direction,
-        "category": categorize(merchant, body), "subject": subject,
+        "category": categorize(merchant, body),
+        "transaction_hour": anomaly_detection.extract_hour_of_day(body),
+        "subject": subject,
         "raw_email": combined
     }
 
@@ -884,10 +886,10 @@ elif page == "How it works":
     st.markdown("""
     1. **Connect:** authorize this app to read Gmail transaction alerts only. No email is sent, modified, or deleted.
     2. **Sync:** manually fetch up to 100 messages matching the Gmail search query.
-    3. **Parse:** detect a currency amount, transaction direction, date, and merchant from each message.
+    3. **Parse:** detect a currency amount, transaction direction, date, merchant, and explicit transaction time when the message body provides one.
     4. **Filter and deduplicate:** skip promotions and unrecognized messages, and keep one row per message ID.
-    5. **Build personal baselines:** learn separately from each account's accepted debit history by category and merchant; compare recent category frequency and weekday timing when enough dated history exists.
-    6. **Score multiple signals:** amount threshold, category amount, merchant amount, frequency, and weekday timing contribute to an explainable 0–100 score. A score of 30 or more creates a review alert; the amount threshold alone is not enough to alert.
+    5. **Build personal baselines:** learn separately from each account's accepted debit history by category, merchant, and category spending per month; compare recent frequency, weekday, and explicit time-of-day patterns when enough history exists.
+    6. **Score multiple signals:** amount threshold, category amount, monthly category spend, merchant amount, frequency, weekday, and time-of-day contribute to an explainable 0–100 score. A score of 30 or more creates a review alert; the amount threshold alone is not enough to alert.
     7. **Learn from review:** mark an alert as expected, unusual but legitimate, or needing further review. Expected and legitimate outcomes clear the alert and become accepted baseline examples; unresolved alerts are kept out of future baselines.
 
     Imported transactions and review decisions are saved to your account. Email message bodies are processed for parsing but are not saved.

@@ -58,6 +58,26 @@ class TransactionFeedbackMigrationTests(unittest.TestCase):
                 updated = database.get_transactions("tester")
                 self.assertEqual(updated[0]["review_feedback"], "legitimate")
                 self.assertFalse(updated[0]["marked_normal"])
+                database.save_transactions(
+                    "tester",
+                    [
+                        {
+                            "id": "timed-1",
+                            "date": "2026-01-02",
+                            "merchant": "Cafe",
+                            "amount": 100,
+                            "direction": "Debit",
+                            "category": "Food",
+                            "transaction_hour": 22,
+                        }
+                    ],
+                )
+                timed_record = next(
+                    record
+                    for record in database.get_transactions("tester")
+                    if record["id"] == "timed-1"
+                )
+                self.assertEqual(timed_record["transaction_hour"], 22)
 
 
 if __name__ == "__main__":
