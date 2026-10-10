@@ -1,6 +1,6 @@
 # Personal Expense Monitor
 
-A Streamlit app that imports transaction-alert emails from Gmail, saves parsed transactions per app account, and flags unusual debits with explainable rules. Gmail is accessed only after the user authorizes Google OAuth with read-only permission and clicks **Sync Gmail now**.
+A Streamlit app that imports transaction-alert emails from Gmail, saves parsed transactions per app account, and scores unusual debits against explainable personal spending baselines. Gmail is accessed only after the user authorizes Google OAuth with read-only permission and clicks **Sync Gmail now**.
 
 ## Local development
 
@@ -57,6 +57,9 @@ Use a different redirect URI matching the Google OAuth client for local developm
 - The app requests only Gmail read-only permission. It does not send, modify, or delete messages.
 - Sync is manual. The default Gmail search checks the last 90 days and each click fetches at most 100 matching messages. Narrow the search with Gmail query operators (for example, `after:2026/01/01 before:2026/04/01`) to import a different date range.
 - Message bodies are processed in memory and are not saved. Parsed transaction fields and review decisions are stored per app account in PostgreSQL. OAuth tokens are encrypted before storage using `TOKEN_ENCRYPTION_KEY`.
+- Personal anomaly baselines are learned separately for each account from earlier debits. Category amounts use a robust range, merchant amounts use the merchant median, and frequency and weekday patterns are used only when enough dated history exists. The app does not infer time-of-day habits because parsed transaction dates do not reliably retain the time of day.
+- Each alert can be marked **Expected spending**, **Unusual but legitimate**, or **Needs further review**. Expected and legitimate decisions clear that alert and let the transaction inform later baselines; unresolved alerts remain out of later baselines. Review outcomes are saved with transaction history.
+- The detector is regression-tested against labeled synthetic examples. Tests compute and assert precision, recall, and false-positive rate; these benchmark metrics are not a guarantee of real-world fraud detection performance.
 - Disconnecting revokes the Google grant and removes the stored token; it does not delete imported transaction history. The **Account data** section can permanently delete the signed-in account's imported transactions. To revoke manually, use the Google Account security settings.
 - The local username/password login is a lightweight app login, not a managed identity provider. Add a dedicated authentication provider, abuse protections, a privacy/retention policy, and operational monitoring before offering the app as a public financial-data service.
 
@@ -79,6 +82,8 @@ JSON imports are saved to the signed-in account; use fictional sample data to pr
 
 ## Detection rules
 
-- Flags debits at or above the configurable amount threshold.
-- For merchants with at least three debits, flags values that are at least a configurable multiple of the merchant median and at least ₹500 above that median.
-- Displays the reason for each alert. These are review signals, not proof of fraud; bank email formats and merchant extraction vary.
+- Scores each debit from 0–100 using the configured amount threshold, category amount history, merchant amount history, recent category frequency, and category weekday timing. A score of 30 or more creates a review alert; the amount threshold alone is not enough to alert.
+- Compares category amounts after at least five accepted examples and merchant amounts after at least three. Category amount limits use the interquartile range and configured multiplier; merchant limits use the merchant median, multiplier, and a ₹500 minimum difference.
+- Compares recent category frequency with the user's dated history after at least four prior examples spanning 28 days. Weekday patterns are considered after at least eight dated examples. Clock-time patterns are not inferred.
+- Keeps reasons visible for each alert and lets users correct outcomes. An expected or legitimate transaction can influence later personal baselines; a transaction marked for further review does not.
+- Run the focused labeled regression benchmark with `python -m unittest discover -s tests`. It tracks precision, recall, and false-positive rate on synthetic known-normal and known-unusual cases.

@@ -8,6 +8,7 @@ import pandas as pd
 import psycopg
 import streamlit as st
 
+import anomaly_detection
 import database
 import gmail_integration
 
@@ -571,32 +572,6 @@ def load_sample_emails():
     with open(DATA_PATH, encoding="utf-8") as f:
         return json.load(f)
 
-def detect_anomalies(df, absolute_threshold, multiplier):
-    df = df.copy()
-    df["is_anomaly"] = False
-    df["reason"] = ""
-    debits = df[df["direction"] == "Debit"]
-    # A global threshold catches very large single purchases even with a small sample.
-    df.loc[(df["direction"] == "Debit") & (df["amount"] >= absolute_threshold), "is_anomaly"] = True
-    df.loc[(df["direction"] == "Debit") & (df["amount"] >= absolute_threshold), "reason"] = (
-        "Amount is at or above your configured review threshold"
-    )
-
-    # Merchant baseline: median is robust to an occasional large purchase.
-    for merchant, group in debits.groupby("merchant"):
-        if len(group) < 3:
-            continue
-        baseline = group["amount"].median()
-        # Require a meaningful absolute difference as well as a multiple of the baseline.
-        candidates = group[(group["amount"] >= baseline * multiplier) & ((group["amount"] - baseline) >= 500)]
-        for idx in candidates.index:
-            df.loc[idx, "is_anomaly"] = True
-            prior_reason = df.loc[idx, "reason"]
-            extra = f"{df.loc[idx, 'amount']:,.0f} is {df.loc[idx, 'amount'] / max(baseline, 1):.1f}× the median for {merchant} (₹{baseline:,.0f})"
-            df.loc[idx, "reason"] = f"{prior_reason}; {extra}".strip("; ")
-    df["review_status"] = df["is_anomaly"].map({True: "Review", False: "Normal"})
-    return df
-
 with st.sidebar:
     username = st.session_state.username
     st.caption(f"Signed in as {username}")
@@ -604,7 +579,6 @@ with st.sidebar:
         st.session_state.authenticated = False
         st.session_state.pop("username", None)
         st.session_state.pop("notified_anomaly_ids", None)
-        st.session_state.pop("normal_override_ids", None)
         st.session_state.pop("gmail_oauth_url", None)
         st.session_state.pop("gmail_notice", None)
         st.session_state.pop("confirm_delete_history", None)
@@ -687,7 +661,6 @@ with st.sidebar:
                 database.delete_transactions(username)
                 st.session_state.confirm_delete_history = False
                 st.session_state.notified_anomaly_ids = set()
-                st.session_state.normal_override_ids = set()
                 st.session_state.gmail_notice = "Saved transaction history deleted."
                 st.rerun()
             if cancel_col.button("Cancel", key=f"cancel_delete_{username}"):
@@ -736,15 +709,12 @@ if not records:
 df = pd.DataFrame(records)
 df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True, format="mixed")
 df = df.drop_duplicates(subset=["id"], keep="first").sort_values("date", ascending=False)
-df = detect_anomalies(df, threshold, multiplier)
-if "marked_normal" not in df:
-    df["marked_normal"] = False
-df["user_marked_normal"] = df["marked_normal"].fillna(False).astype(bool)
-if "normal_override_ids" not in st.session_state:
-    st.session_state.normal_override_ids = set()
-df["user_marked_normal"] |= df["id"].astype(str).isin(st.session_state.normal_override_ids)
-df.loc[df["user_marked_normal"], "is_anomaly"] = False
-df.loc[df["user_marked_normal"], "review_status"] = "Marked normal"
+if "review_feedback" not in df:
+    df["review_feedback"] = None
+if "marked_normal" in df:
+    legacy_expected = df["marked_normal"].fillna(False).astype(bool)
+    df.loc[legacy_expected & df["review_feedback"].isna(), "review_feedback"] = "expected"
+df = anomaly_detection.detect_anomalies(df, threshold, multiplier)
 
 debits = df[df["direction"] == "Debit"]
 credits = df[df["direction"] == "Credit"]
@@ -834,24 +804,52 @@ elif page == "Alerts":
                 a.metric("Amount", f"₹{row['amount']:,.2f}")
                 b.markdown(f"**{row['merchant']}** · {row['date'].strftime('%d %b %Y') if pd.notna(row['date']) else 'Date unknown'}")
                 b.write(row["reason"] or "This transaction crossed an alert rule.")
-                b.caption(f"Category: {row['category']} · Transaction ID: {row['id']}")
-                if b.button("Mark as normal", key=f"mark_normal_{row['id']}"):
-                    database.set_transaction_marked_normal(username, str(row["id"]), True)
-                    st.session_state.normal_override_ids.add(str(row["id"]))
-                    st.rerun()
-    marked_normal = df[df["user_marked_normal"]]
-    if not marked_normal.empty:
-        st.subheader("Marked as normal")
-        st.caption("Your review decisions are saved to your account.")
-        for _, row in marked_normal.sort_values("date", ascending=False).iterrows():
+                b.caption(
+                    f"Category: {row['category']} · Score: {row['anomaly_score']}/100 "
+                    f"· Transaction ID: {row['id']}"
+                )
+                if row["review_feedback"] in anomaly_detection.REVIEW_FEEDBACK:
+                    b.caption(
+                        "Your feedback: "
+                        + anomaly_detection.REVIEW_FEEDBACK[row["review_feedback"]]
+                    )
+                feedback_columns = st.columns(3)
+                for column, (feedback, label) in zip(
+                    feedback_columns, anomaly_detection.REVIEW_FEEDBACK.items()
+                ):
+                    if column.button(
+                        label,
+                        key=f"feedback_{feedback}_{row['id']}",
+                        use_container_width=True,
+                    ):
+                        database.set_transaction_feedback(
+                            username, str(row["id"]), feedback
+                        )
+                        st.rerun()
+    reviewed = df[df["review_feedback"].isin(("expected", "legitimate"))]
+    if not reviewed.empty:
+        st.subheader("Reviewed transactions")
+        st.caption("Your feedback is saved and informs future personal baselines.")
+        for _, row in reviewed.sort_values("date", ascending=False).iterrows():
             with st.container(border=True):
                 a, b = st.columns([1, 4])
                 a.metric("Amount", f"₹{row['amount']:,.2f}")
                 b.markdown(f"**{row['merchant']}** · {row['date'].strftime('%d %b %Y') if pd.notna(row['date']) else 'Date unknown'}")
                 b.caption(f"Category: {row['category']} · Transaction ID: {row['id']}")
-                if b.button("Restore alert", key=f"restore_alert_{row['id']}"):
-                    database.set_transaction_marked_normal(username, str(row["id"]), False)
-                    st.session_state.normal_override_ids.discard(str(row["id"]))
+                b.caption(anomaly_detection.REVIEW_FEEDBACK[row["review_feedback"]])
+                new_feedback = b.selectbox(
+                    "Update review outcome",
+                    options=list(anomaly_detection.REVIEW_FEEDBACK),
+                    format_func=anomaly_detection.REVIEW_FEEDBACK.get,
+                    index=list(anomaly_detection.REVIEW_FEEDBACK).index(
+                        row["review_feedback"]
+                    ),
+                    key=f"review_feedback_{row['id']}",
+                )
+                if b.button("Save review outcome", key=f"save_feedback_{row['id']}"):
+                    database.set_transaction_feedback(
+                        username, str(row["id"]), new_feedback
+                    )
                     st.rerun()
     st.caption("Always verify against your bank's records. An alert is not a fraud determination.")
 
@@ -882,17 +880,23 @@ elif page == "Transactions":
     st.download_button("Download filtered transactions as CSV", data=csv, file_name="transactions.csv", mime="text/csv")
 
 elif page == "How it works":
-    st.subheader("Explainable baseline rules")
+    st.subheader("Personalized anomaly scoring")
     st.markdown("""
     1. **Connect:** authorize this app to read Gmail transaction alerts only. No email is sent, modified, or deleted.
     2. **Sync:** manually fetch up to 100 messages matching the Gmail search query.
     3. **Parse:** detect a currency amount, transaction direction, date, and merchant from each message.
     4. **Filter and deduplicate:** skip promotions and unrecognized messages, and keep one row per message ID.
-    5. **Flag large purchases:** mark debits at or above the configurable amount threshold.
-    6. **Compare merchant behavior:** for merchants with at least three debit examples, compare amounts with that merchant's median. An amount is flagged if it is at least the chosen multiple of the median and at least ₹500 higher.
+    5. **Build personal baselines:** learn separately from each account's accepted debit history by category and merchant; compare recent category frequency and weekday timing when enough dated history exists.
+    6. **Score multiple signals:** amount threshold, category amount, merchant amount, frequency, and weekday timing contribute to an explainable 0–100 score. A score of 30 or more creates a review alert; the amount threshold alone is not enough to alert.
+    7. **Learn from review:** mark an alert as expected, unusual but legitimate, or needing further review. Expected and legitimate outcomes clear the alert and become accepted baseline examples; unresolved alerts are kept out of future baselines.
 
     Imported transactions and review decisions are saved to your account. Email message bodies are processed for parsing but are not saved.
     """)
+    st.caption(
+        "Precision, recall, and false-positive rate are computed and asserted on "
+        "the labeled synthetic regression dataset in tests; user feedback is not treated as "
+        "proof of fraud."
+    )
     st.warning("Limitations: bank email formats vary, merchant extraction is heuristic, and Gmail must be synced manually. This is not a bank-grade fraud detector.")
     if emails:
         with st.expander("Preview imported message text"):

@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 import time
 import ipaddress
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
@@ -74,16 +75,26 @@ def is_persistent():
     return _is_postgres()
 
 
+@contextmanager
 def get_connection():
     database_url = _database_url()
     if database_url:
         import psycopg
         from psycopg.rows import dict_row
 
-        return psycopg.connect(database_url, sslmode="require", row_factory=dict_row)
+        with psycopg.connect(
+            database_url, sslmode="require", row_factory=dict_row
+        ) as conn:
+            yield conn
+        return
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
     return conn
 
 
@@ -141,9 +152,29 @@ def init_db():
                 category {text_type} NOT NULL,
                 subject {text_type} NOT NULL,
                 marked_normal INTEGER NOT NULL DEFAULT 0,
+                review_feedback {text_type},
                 PRIMARY KEY (user_id, transaction_id)
             )
         """)
+        if _is_postgres():
+            _execute(
+                conn,
+                "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS review_feedback TEXT",
+            )
+        else:
+            transaction_columns = {
+                row["name"]
+                for row in _execute(conn, "PRAGMA table_info(transactions)").fetchall()
+            }
+            if "review_feedback" not in transaction_columns:
+                _execute(conn, "ALTER TABLE transactions ADD COLUMN review_feedback TEXT")
+        _execute(
+            conn,
+            """
+            UPDATE transactions SET review_feedback = 'expected'
+            WHERE marked_normal = 1 AND review_feedback IS NULL
+            """,
+        )
         _execute(conn, f"""
             CREATE TABLE IF NOT EXISTS gmail_oauth_states (
                 state_hash {text_type} PRIMARY KEY,
@@ -348,7 +379,7 @@ def get_transactions(username: str) -> list[dict]:
             conn,
             """
             SELECT transaction_id AS id, transaction_date AS date, merchant, amount,
-                   direction, category, subject, marked_normal
+                   direction, category, subject, marked_normal, review_feedback
             FROM transactions WHERE user_id = ? ORDER BY transaction_date DESC
             """,
             (user_id,),
@@ -356,7 +387,9 @@ def get_transactions(username: str) -> list[dict]:
         return [dict(row) for row in rows]
 
 
-def set_transaction_marked_normal(username: str, transaction_id: str, marked: bool):
+def set_transaction_feedback(username: str, transaction_id: str, feedback: str):
+    if feedback not in {"expected", "legitimate", "needs_review"}:
+        raise ValueError("Choose a supported transaction review outcome.")
     with get_connection() as conn:
         user_id = _user_id(conn, username)
         if user_id is None:
@@ -364,10 +397,11 @@ def set_transaction_marked_normal(username: str, transaction_id: str, marked: bo
         _execute(
             conn,
             """
-            UPDATE transactions SET marked_normal = ?
+            UPDATE transactions
+            SET review_feedback = ?, marked_normal = ?
             WHERE user_id = ? AND transaction_id = ?
             """,
-            (int(marked), user_id, transaction_id),
+            (feedback, int(feedback == "expected"), user_id, transaction_id),
         )
 
 
