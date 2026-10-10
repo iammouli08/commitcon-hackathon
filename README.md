@@ -25,7 +25,7 @@ Create a Supabase project and copy its PostgreSQL connection string. Use the ses
 
 1. Create/select a Google Cloud project and enable the **Gmail API**.
 2. Configure the OAuth consent screen for external users and add the scope `https://www.googleapis.com/auth/gmail.readonly`.
-3. Create a **Web application** OAuth client. Add the exact deployed app URL (for example, `https://your-app.streamlit.app`) as an authorized redirect URI. Add `http://localhost:8501` too if you will test locally.
+3. Create a **Web application** OAuth client. Add the exact deployed app URL as an **Authorized redirect URI** (not a JavaScript origin); this server-side OAuth flow does not need an authorized JavaScript origin. The URI must exactly match `redirect_uri` in Streamlit secrets, including the scheme, hostname, path, and trailing slash if present. For example, if the secret is `https://your-app.streamlit.app/`, register that exact value. Add the local `redirect_uri` too if you will test locally.
 4. Add test users while the consent screen is in testing mode.
 
 `gmail.readonly` is a restricted Gmail scope. Google requires OAuth verification and may require a security assessment before an app can serve the public. During testing, Google may limit refresh-token lifetime. Complete Google’s current verification requirements before treating the deployment as a public production service.
@@ -41,7 +41,7 @@ TOKEN_ENCRYPTION_KEY = "GENERATE_A_FERNET_KEY"
 [google_oauth]
 client_id = "YOUR_GOOGLE_OAUTH_CLIENT_ID"
 client_secret = "YOUR_GOOGLE_OAUTH_CLIENT_SECRET"
-redirect_uri = "https://your-app.streamlit.app"
+redirect_uri = "https://your-app.streamlit.app/"
 ```
 
 Generate the encryption key locally with:
